@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  release:
+    types: [created]
+
+jobs:
+  build-rpi:
+    name: Build release image for Raspberry Pi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Add ARMhf architecture and install cross-compilation toolchain
+        run: |
+          sudo dpkg --add-architecture armhf
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-arm-linux-gnueabihf \
+            g++-arm-linux-gnueabihf \
+            make \
+            sqlite3 \
+            pkg-config \
+            libasound2-dev:armhf \
+            libfftw3-dev:armhf \
+            libgtk-3-dev:armhf \
+            libsqlite3-dev:armhf \
+            libncurses5-dev:armhf
+
+      - name: Build WiringPi for ARM
+        run: |
+          git clone https://github.com/WiringPi/WiringPi.git /tmp/WiringPi
+          cd /tmp/WiringPi/wiringPi
+          make CC=arm-linux-gnueabihf-gcc AR=arm-linux-gnueabihf-ar
+          sudo cp libwiringPi.so* /usr/lib/arm-linux-gnueabihf/
+          sudo cp wiringPi.h /usr/include/
+
+      - name: Build ft8_lib for ARM
+        working-directory: ft8_lib
+        run: |
+          make CC=arm-linux-gnueabihf-gcc AR=arm-linux-gnueabihf-ar all
+
+      - name: Create required data files
+        run: |
+          mkdir -p data audio web
+          cd data
+          sqlite3 sbitx.db < create_db.sql
+
+      - name: Cross-compile sbitx for Raspberry Pi (ARMhf)
+        run: |
+          VERSION=$(grep VER sdr_ui.h | awk 'FNR==1{print $4}' | sed -e 's/"//g')
+          echo "Building version: $VERSION"
+          PKG_CONFIG_PATH=/usr/lib/arm-linux-gnueabihf/pkgconfig \
+          PKG_CONFIG_LIBDIR=/usr/lib/arm-linux-gnueabihf/pkgconfig \
+          arm-linux-gnueabihf-gcc -g -o sbitx \
+            vfo.c si570.c sbitx_sound.c fft_filter.c sbitx_gtk.c sbitx_utils.c \
+            i2cbb.c si5351v2.c ini.c hamlib.c queue.c modems.c logbook.c \
+            modem_cw.c settings_ui.c oled.c hist_disp.c ntputil.c \
+            telnet.c macros.c modem_ft8.c remote.c mongoose.c webserver.c sbitx.c \
+            ft8_lib/libft8.a \
+            -lwiringPi -lasound -lm -lfftw3 -lfftw3f -pthread -lncurses -lsqlite3 \
+            -L/usr/lib/arm-linux-gnueabihf \
+            $(PKG_CONFIG_PATH=/usr/lib/arm-linux-gnueabihf/pkgconfig pkg-config --cflags gtk+-3.0) \
+            $(PKG_CONFIG_PATH=/usr/lib/arm-linux-gnueabihf/pkgconfig pkg-config --libs gtk+-3.0)
+          file sbitx
+
+      - name: Package release archive
+        run: |
+          VERSION=$(grep VER sdr_ui.h | awk 'FNR==1{print $4}' | sed -e 's/"//g')
+          ARCHIVE="zbitx-${VERSION}-rpi.tar.gz"
+          mkdir -p release release_pkg/zbitx
+          cp sbitx release_pkg/zbitx/
+          cp start.sh update update_zbitx release_pkg/zbitx/
+          cp sbitx_user_settings.ini sbitx_wisdom.wis sbitx_wisdom_f.wis release_pkg/zbitx/
+          cp -r data web release_pkg/zbitx/
+          tar -czf "release/${ARCHIVE}" -C release_pkg zbitx
+          echo "ARCHIVE=${ARCHIVE}" >> $GITHUB_ENV
+
+      - name: Upload release asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: release/${{ env.ARCHIVE }}
+          asset_name: ${{ env.ARCHIVE }}
+          asset_content_type: application/gzip
