@@ -1,12 +1,31 @@
 name: Release
 
 on:
-  release:
-    types: [created]
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >
+          Release tag (e.g. v3.052-rc1 for a release candidate or v3.052 for
+          final). Defaults to the version from sdr_ui.h with an -rc1 suffix.
+        required: false
+        default: ''
+      prerelease:
+        description: 'Mark as pre-release (release candidate)'
+        type: boolean
+        required: false
+        default: true
+
+# Only allow one release build at a time to avoid concurrent pushes to main.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   build-rpi:
-    name: Build release image for Raspberry Pi
+    name: Build and publish release image for Raspberry Pi
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -14,6 +33,32 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve version and tag
+        run: |
+          CODE_VERSION=$(grep '#define VER_STR' sdr_ui.h | awk '{print $4}' | sed -e 's/"//g' | awk '{print $NF}')
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.tag }}" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="${CODE_VERSION}-rc1"
+          fi
+          ARCHIVE="zbitx-${TAG}-rpi.tar.gz"
+          echo "CODE_VERSION=${CODE_VERSION}" >> $GITHUB_ENV
+          echo "TAG=${TAG}"                   >> $GITHUB_ENV
+          echo "ARCHIVE=${ARCHIVE}"           >> $GITHUB_ENV
+
+      - name: Create and push release tag
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ env.TAG }}" -m "Release ${{ env.TAG }}"
+          git push origin "${{ env.TAG }}"
 
       - name: Add ARMhf architecture and install cross-compilation toolchain
         run: |
@@ -52,8 +97,7 @@ jobs:
 
       - name: Cross-compile sbitx for Raspberry Pi (ARMhf)
         run: |
-          VERSION=$(grep VER sdr_ui.h | awk 'FNR==1{print $4}' | sed -e 's/"//g')
-          echo "Building version: $VERSION"
+          echo "Building version: ${{ env.CODE_VERSION }} (tag: ${{ env.TAG }})"
           PKG_CONFIG_PATH=/usr/lib/arm-linux-gnueabihf/pkgconfig \
           PKG_CONFIG_LIBDIR=/usr/lib/arm-linux-gnueabihf/pkgconfig \
           arm-linux-gnueabihf-gcc -g -o sbitx \
@@ -70,22 +114,38 @@ jobs:
 
       - name: Package release archive
         run: |
-          VERSION=$(grep VER sdr_ui.h | awk 'FNR==1{print $4}' | sed -e 's/"//g')
-          ARCHIVE="zbitx-${VERSION}-rpi.tar.gz"
           mkdir -p release release_pkg/zbitx
           cp sbitx release_pkg/zbitx/
           cp start.sh update update_zbitx release_pkg/zbitx/
           cp sbitx_user_settings.ini sbitx_wisdom.wis sbitx_wisdom_f.wis release_pkg/zbitx/
           cp -r data web release_pkg/zbitx/
-          tar -czf "release/${ARCHIVE}" -C release_pkg zbitx
-          echo "ARCHIVE=${ARCHIVE}" >> $GITHUB_ENV
+          tar -czf "release/${{ env.ARCHIVE }}" -C release_pkg zbitx
+          rm -rf release_pkg
+          echo "Release archive created: release/${{ env.ARCHIVE }}"
 
-      - name: Upload release asset
-        uses: actions/upload-release-asset@v1
+      - name: Commit release archive to repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Switch to (or create) the main branch so the archive is committed there
+          git fetch origin main
+          git checkout -B main origin/main
+          git add -f "release/${{ env.ARCHIVE }}"
+          git diff --cached --quiet || \
+            git commit -m "Add release archive ${{ env.ARCHIVE }} [skip ci]"
+          git push origin main
+
+      - name: Publish GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: release/${{ env.ARCHIVE }}
-          asset_name: ${{ env.ARCHIVE }}
-          asset_content_type: application/gzip
+        run: |
+          # Tags containing -rc, -alpha, or -beta are treated as pre-releases.
+          PRERELEASE_FLAG=""
+          if [ "${{ github.event.inputs.prerelease }}" = "true" ] || echo "${{ env.TAG }}" | grep -qE '\-(rc|alpha|beta)'; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+          gh release create "${{ env.TAG }}" \
+            "release/${{ env.ARCHIVE }}" \
+            --title "zBitx ${{ env.TAG }}" \
+            --generate-notes \
+            $PRERELEASE_FLAG
